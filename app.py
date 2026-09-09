@@ -7,6 +7,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 import pdfplumber
 import openpyxl
+import jieba
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -117,6 +118,13 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 # ===================== 索引重建 =====================
+def jieba_tokenizer(text):
+    """jieba 分词器，用于 TF-IDF"""
+    # 去除标点和空白
+    text = re.sub(r'[\s\W]+', ' ', text)
+    return [w for w in jieba.cut(text) if len(w.strip()) > 0 and w.strip() != ' ']
+
+
 def rebuild_index():
     """重建 TF-IDF 索引"""
     global tfidf_matrix, vectorizer, all_chunks
@@ -138,18 +146,19 @@ def rebuild_index():
             vectorizer = None
             return
         
+        # 对每个 chunk 预先分词
         texts = [c["text"] for c in all_chunks]
         vectorizer = TfidfVectorizer(
-            max_features=10000,
+            tokenizer=jieba_tokenizer,
+            max_features=20000,
             ngram_range=(1, 2),
-            stop_words=None,  # 中文不需要停用词
-            token_pattern=r'(?u)\b\w+\b'
+            sublinear_tf=True
         )
         tfidf_matrix = vectorizer.fit_transform(texts)
         print(f"[索引] 重建完成: {len(all_chunks)} 个文本块")
 
 def search(query, top_k=TOP_K):
-    """TF-IDF 检索最相关的文本块"""
+    """TF-IDF + jieba 分词检索最相关的文本块"""
     if not vectorizer or tfidf_matrix is None or not all_chunks:
         return []
     
@@ -159,11 +168,30 @@ def search(query, top_k=TOP_K):
     
     results = []
     for idx in top_indices:
-        if scores[idx] > 0.01:  # 最低相关度阈值
+        if scores[idx] > 0.005:  # 降低阈值，分词后分数会变小
             results.append({
                 **all_chunks[idx],
                 "score": float(scores[idx])
             })
+    
+    # 如果精确检索没结果，尝试关键词拆分回退
+    if not results:
+        keywords = jieba_tokenizer(query)
+        if keywords:
+            # 用关键词逐个匹配，取最高分
+            chunk_scores = [0.0] * len(all_chunks)
+            for kw in keywords:
+                kw_vec = vectorizer.transform([kw])
+                kw_scores = cosine_similarity(kw_vec, tfidf_matrix).flatten()
+                for i in range(len(all_chunks)):
+                    chunk_scores[i] = max(chunk_scores[i], kw_scores[i])
+            top_indices = sorted(range(len(chunk_scores)), key=lambda i: chunk_scores[i], reverse=True)[:top_k]
+            for idx in top_indices:
+                if chunk_scores[idx] > 0.005:
+                    results.append({
+                        **all_chunks[idx],
+                        "score": float(chunk_scores[idx])
+                    })
     
     return results
 
