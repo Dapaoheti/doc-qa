@@ -2,19 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 COPY requirements.txt .
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-eng \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
-
-# 创建数据目录
 RUN mkdir -p /app/uploads
 
 EXPOSE 5000
-
-# 环境变量配置
-# LLM_API_BASE - OpenAI 兼容 API 地址
-# LLM_API_KEY  - API 密钥
-# LLM_MODEL    - 模型名称
-# PORT         - 端口号
-
 CMD ["python", "app.py"]

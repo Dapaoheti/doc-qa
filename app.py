@@ -9,6 +9,14 @@ import pdfplumber
 import openpyxl
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+# OCR 支持（扫描件PDF）
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 # ===================== 配置 =====================
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -34,17 +42,35 @@ all_chunks = []  # flat list of { doc_id, doc_name, chunk_id, text }
 lock = threading.Lock()
 
 # ===================== 文件解析 =====================
+def has_chinese(text):
+    """检查文本是否包含中文"""
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
+
 def parse_pdf(filepath):
-    """解析 PDF 文件，返回文本段落列表"""
+    """解析 PDF 文件，支持 OCR 识别扫描件"""
     chunks = []
     try:
         with pdfplumber.open(filepath) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
                 text = page.extract_text() or ""
-                if text.strip():
+                if text.strip() and has_chinese(text):
                     chunks.append({"page": page_num, "text": text.strip()})
     except Exception as e:
         print(f"[PDF解析错误] {filepath}: {e}")
+
+    # 如果 pdfplumber 没提取到中文，尝试 OCR
+    if not chunks and OCR_AVAILABLE:
+        print(f"[PDF] 文字提取失败，尝试 OCR 识别...")
+        try:
+            images = convert_from_path(filepath, dpi=200)
+            for page_num, img in enumerate(images, 1):
+                text = pytesseract.image_to_string(img, lang='chi_sim+eng')
+                if text.strip():
+                    chunks.append({"page": page_num, "text": text.strip()})
+            print(f"[PDF] OCR 识别完成: {len(chunks)} 页")
+        except Exception as e:
+            print(f"[OCR错误] {e}")
+
     return chunks
 
 def parse_excel(filepath):
