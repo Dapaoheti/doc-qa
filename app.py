@@ -9,6 +9,7 @@ import pdfplumber
 import openpyxl
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
 # OCR 支持（扫描件PDF）
 try:
     from pdf2image import convert_from_path
@@ -28,7 +29,7 @@ LLM_API_KEY  = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL    = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
 # 检索配置
-TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
+TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
 CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "50"))
 
@@ -42,6 +43,34 @@ all_chunks = []  # flat list of { doc_id, doc_name, chunk_id, text }
 lock = threading.Lock()
 
 # ===================== 文件解析 =====================
+def clean_ocr_text(text):
+    """清理 OCR 产生的乱码和噪声"""
+    lines = text.split('\n')
+    clean_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # 去除太短的行
+        if len(line) < 4:
+            continue
+        # 计算中文字符占比
+        cn_chars = len(re.findall(r'[\u4e00-\u9fff]', line))
+        total_chars = len(re.sub(r'\s', '', line))  # 不计空格
+        if total_chars == 0:
+            continue
+        cn_ratio = cn_chars / total_chars
+        # 中文占比低于20%的行，跳过（可能是乱码）
+        if cn_ratio < 0.2 and len(line) > 5:
+            continue
+        # 清理常见的 OCR 错误符号
+        line = re.sub(r'[|\[\]{}]', '', line)
+        line = re.sub(r'\s+', ' ', line)
+        line = line.strip()
+        if len(line) >= 2:
+            clean_lines.append(line)
+    return '\n'.join(clean_lines)
+
 def has_chinese(text):
     """检查文本是否包含中文"""
     return bool(re.search(r'[\u4e00-\u9fff]', text))
@@ -57,7 +86,7 @@ def parse_pdf(filepath):
                     chunks.append({"page": page_num, "text": text.strip()})
     except Exception as e:
         print(f"[PDF解析错误] {filepath}: {e}")
-
+    
     # 如果 pdfplumber 没提取到中文，尝试 OCR
     if not chunks and OCR_AVAILABLE:
         print(f"[PDF] 文字提取失败，尝试 OCR 识别...")
@@ -66,11 +95,13 @@ def parse_pdf(filepath):
             for page_num, img in enumerate(images, 1):
                 text = pytesseract.image_to_string(img, lang='chi_sim+eng')
                 if text.strip():
-                    chunks.append({"page": page_num, "text": text.strip()})
+                    cleaned = clean_ocr_text(text)
+                    if cleaned.strip():
+                        chunks.append({"page": page_num, "text": cleaned.strip()})
             print(f"[PDF] OCR 识别完成: {len(chunks)} 页")
         except Exception as e:
             print(f"[OCR错误] {e}")
-
+    
     return chunks
 
 def parse_excel(filepath):
@@ -235,27 +266,33 @@ def search(query, top_k=TOP_K):
 def call_llm(question, context_chunks):
     """调用 LLM 回答问题"""
     if not LLM_API_KEY:
-        # 没有配置 API Key，直接返回检索结果
+        # 没有配置 API Key，返回精简的检索结果
         if not context_chunks:
             return "未找到相关内容，请确认已上传制度文件。"
         answer = "⚠️ 未配置 LLM API，以下是检索到的相关内容：\n\n"
-        for i, c in enumerate(context_chunks, 1):
-            answer += f"**📄 来源 {i}：{c['doc_name']}（第{c['page']}页）**\n"
-            answer += c["text"][:300] + ("..." if len(c["text"]) > 300 else "") + "\n\n"
-        return answer
+        # 只显示前3个最相关的来源
+        for i, c in enumerate(context_chunks[:3], 1):
+            clean_text = c['text'].replace('\n', ' ').strip()
+            # 去除乱码字符
+            clean_text = re.sub(r'[^\u4e00-\u9fff\w\s，。：；！？、（）()\-+/\\.%元天月年人]', '', clean_text)
+            clean_text = clean_text[:200] + ('...' if len(clean_text) > 200 else '')
+            answer += f"**{i}. {c['doc_name']}（第{c['page']}页）**\n"
+            answer += clean_text + "\n\n"
+        return answer.strip()
     
     # 构建上下文
     context = ""
     for i, c in enumerate(context_chunks, 1):
         context += f"\n[来源{i}: {c['doc_name']} 第{c['page']}页]\n{c['text']}\n"
     
-    prompt = f"""你是一个企业制度文件问答助手。请根据以下制度文件内容，准确回答用户的问题。
+    prompt = f"""你是一个企业制度文件问答助手。请根据以下制度文件内容，简洁准确地回答用户的问题。
 
 要求：
 1. 严格按照制度文件内容回答，不要编造
 2. 如果文件中没有相关信息，明确告知用户
-3. 回答时注明来源文件名和页码
-4. 使用清晰的格式（分点、编号等）
+3. 回答要简洁明了，使用分点格式
+4. 不要显示乱码或无法识别的字符
+5. 来源只标注文件名即可
 
 === 制度文件内容 ===
 {context}
@@ -387,6 +424,24 @@ def delete_doc(doc_id):
     
     rebuild_index()
     return jsonify({"ok": True, "remaining": len(documents)})
+
+@app.route("/api/debug", methods=["GET"])
+def debug():
+    """调试：查看所有chunks内容"""
+    result = []
+    for doc in documents.values():
+        doc_info = {"name": doc["name"], "chunks": []}
+        for i, chunk in enumerate(doc["chunks"]):
+            doc_info["chunks"].append({
+                "id": i,
+                "page": chunk.get("page", ""),
+                "text_len": len(chunk["text"]),
+                "text_preview": chunk["text"][:200],
+                "has_chinese": bool(re.search(r'[\u4e00-\u9fff]', chunk["text"])),
+                "tokens_sample": chinese_tokenizer(chunk["text"])[:20]
+            })
+        result.append(doc_info)
+    return jsonify({"docs": result, "total_chunks": len(all_chunks)})
 
 @app.route("/api/ask", methods=["POST"])
 def ask():
