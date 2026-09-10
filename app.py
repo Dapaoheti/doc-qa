@@ -118,25 +118,22 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 # ===================== 索引重建 =====================
 def chinese_tokenizer(text):
-    """中文分词器：按标点/空格切分 + 2-4字滑动窗口"""
-    # 按标点和空格切分成词块
-    segments = re.split(r'[\s\W]+', text)
+    """中文分词器：2-4字滑动窗口 + 关键词提取"""
     tokens = []
-    for seg in segments:
-        if not seg.strip():
-            continue
-        # 英文/数字直接作为 token
-        if re.match(r'^[a-zA-Z0-9]+$', seg):
-            tokens.append(seg.lower())
-            continue
-        # 中文：2-4字滑动窗口
-        seg = seg.strip()
-        for n in range(2, 5):
+    # 提取中文连续片段
+    cn_segments = re.findall(r'[一-鿿]+', text)
+    for seg in cn_segments:
+        # 2-4字滑动窗口
+        for n in range(2, min(5, len(seg) + 1)):
             for i in range(len(seg) - n + 1):
                 tokens.append(seg[i:i+n])
-        # 也保留完整词
+        # 完整词
         if len(seg) >= 2:
             tokens.append(seg)
+    # 提取英文/数字
+    en_segments = re.findall(r'[a-zA-Z0-9]+', text)
+    for seg in en_segments:
+        tokens.append(seg.lower())
     return tokens
 
 
