@@ -7,7 +7,6 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 import pdfplumber
 import openpyxl
-import jieba
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -118,11 +117,27 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 # ===================== 索引重建 =====================
-def jieba_tokenizer(text):
-    """jieba 分词器，用于 TF-IDF"""
-    # 去除标点和空白
-    text = re.sub(r'[\s\W]+', ' ', text)
-    return [w for w in jieba.cut(text) if len(w.strip()) > 0 and w.strip() != ' ']
+def chinese_tokenizer(text):
+    """中文分词器：按标点/空格切分 + 2-4字滑动窗口"""
+    # 按标点和空格切分成词块
+    segments = re.split(r'[\s\W]+', text)
+    tokens = []
+    for seg in segments:
+        if not seg.strip():
+            continue
+        # 英文/数字直接作为 token
+        if re.match(r'^[a-zA-Z0-9]+$', seg):
+            tokens.append(seg.lower())
+            continue
+        # 中文：2-4字滑动窗口
+        seg = seg.strip()
+        for n in range(2, 5):
+            for i in range(len(seg) - n + 1):
+                tokens.append(seg[i:i+n])
+        # 也保留完整词
+        if len(seg) >= 2:
+            tokens.append(seg)
+    return tokens
 
 
 def rebuild_index():
@@ -146,19 +161,18 @@ def rebuild_index():
             vectorizer = None
             return
         
-        # 对每个 chunk 预先分词
         texts = [c["text"] for c in all_chunks]
         vectorizer = TfidfVectorizer(
-            tokenizer=jieba_tokenizer,
-            max_features=20000,
-            ngram_range=(1, 2),
+            tokenizer=chinese_tokenizer,
+            max_features=30000,
+            ngram_range=(1, 1),
             sublinear_tf=True
         )
         tfidf_matrix = vectorizer.fit_transform(texts)
         print(f"[索引] 重建完成: {len(all_chunks)} 个文本块")
 
 def search(query, top_k=TOP_K):
-    """TF-IDF + jieba 分词检索最相关的文本块"""
+    """TF-IDF + 中文分词检索最相关的文本块"""
     if not vectorizer or tfidf_matrix is None or not all_chunks:
         return []
     
@@ -168,17 +182,16 @@ def search(query, top_k=TOP_K):
     
     results = []
     for idx in top_indices:
-        if scores[idx] > 0.005:  # 降低阈值，分词后分数会变小
+        if scores[idx] > 0.001:
             results.append({
                 **all_chunks[idx],
                 "score": float(scores[idx])
             })
     
-    # 如果精确检索没结果，尝试关键词拆分回退
+    # 如果整句没匹配到，拆词逐个匹配
     if not results:
-        keywords = jieba_tokenizer(query)
+        keywords = chinese_tokenizer(query)
         if keywords:
-            # 用关键词逐个匹配，取最高分
             chunk_scores = [0.0] * len(all_chunks)
             for kw in keywords:
                 kw_vec = vectorizer.transform([kw])
@@ -187,7 +200,7 @@ def search(query, top_k=TOP_K):
                     chunk_scores[i] = max(chunk_scores[i], kw_scores[i])
             top_indices = sorted(range(len(chunk_scores)), key=lambda i: chunk_scores[i], reverse=True)[:top_k]
             for idx in top_indices:
-                if chunk_scores[idx] > 0.005:
+                if chunk_scores[idx] > 0.001:
                     results.append({
                         **all_chunks[idx],
                         "score": float(chunk_scores[idx])
