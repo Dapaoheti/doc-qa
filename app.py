@@ -709,8 +709,16 @@ function refreshDocs(){
 }
 
 function delDoc(id){
-  if (!adminToken) return;
-  fetch("/api/docs/"+id, {method:"DELETE", headers:{'Authorization':'Bearer '+adminToken}}).then(function(){ refreshDocs(); });
+  if (!adminToken) { showToast('请先以管理员身份登录'); return; }
+  if (!confirm('确定删除此文件？')) return;
+  fetch("/api/docs/"+id, {method:"DELETE", headers:{'Authorization':'Bearer '+adminToken}})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { showToast(d.error); return; }
+      showToast('已删除');
+      refreshDocs();
+    })
+    .catch(function(e){ showToast('删除失败: ' + e.message); });
 }
 
 // 提问（不需要管理员权限）
