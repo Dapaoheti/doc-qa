@@ -23,6 +23,12 @@ except ImportError:
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# 管理员密码
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin2026")
+
+# 简单session存储
+admin_sessions = set()
+
 # LLM 配置（支持任何 OpenAI 兼容 API）
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://api.openai.com/v1")
 LLM_API_KEY  = os.environ.get("LLM_API_KEY", "")
@@ -327,13 +333,45 @@ def call_llm(question, context_chunks):
         return answer
 
 # ===================== API 路由 =====================
+def check_admin():
+    """检查是否为管理员"""
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if not token:
+        token = request.args.get('token', '')
+    return token in admin_sessions
+
+@app.route("/api/login", methods=["POST"])
+def admin_login():
+    """管理员登录"""
+    data = request.get_json() or {}
+    password = data.get("password", "")
+    if password == ADMIN_PASSWORD:
+        token = str(uuid.uuid4())
+        admin_sessions.add(token)
+        return jsonify({"ok": True, "token": token})
+    return jsonify({"error": "密码错误"}), 401
+
+@app.route("/api/logout", methods=["POST"])
+def admin_logout():
+    """管理员登出"""
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    admin_sessions.discard(token)
+    return jsonify({"ok": True})
+
+@app.route("/api/check-auth", methods=["GET"])
+def check_auth():
+    """检查登录状态"""
+    return jsonify({"admin": check_admin()})
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route("/api/upload", methods=["POST"])
 def upload():
-    """上传并解析文件"""
+    """上传并解析文件（仅管理员）"""
+    if not check_admin():
+        return jsonify({"error": "需要管理员权限"}), 403
     if "file" not in request.files:
         return jsonify({"error": "没有文件"}), 400
     
@@ -397,7 +435,9 @@ def upload():
 
 @app.route("/api/docs", methods=["GET"])
 def list_docs():
-    """列出已上传的文档"""
+    """列出已上传的文档（仅管理员）"""
+    if not check_admin():
+        return jsonify({"error": "需要管理员权限"}), 403
     docs = []
     for d in documents.values():
         docs.append({
@@ -411,7 +451,9 @@ def list_docs():
 
 @app.route("/api/docs/<doc_id>", methods=["DELETE"])
 def delete_doc(doc_id):
-    """删除文档"""
+    """删除文档（仅管理员）"""
+    if not check_admin():
+        return jsonify({"error": "需要管理员权限"}), 403
     if doc_id not in documents:
         return jsonify({"error": "文档不存在"}), 404
     
@@ -523,6 +565,8 @@ body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f7;c
 .loading{display:inline-block;width:16px;height:16px;border:2px solid #e5e5e5;border-top-color:#0071e3;border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
 pre{white-space:pre-wrap;font-family:inherit}
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%) translateY(20px);background:#2a2723;color:#ece6d8;padding:10px 20px;border-radius:12px;font-size:.85rem;z-index:300;opacity:0;transition:all .3s;border:1px solid rgba(212,168,67,.15);white-space:nowrap;pointer-events:none;max-width:90vw;text-align:center}
+.toast.visible{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
 </head>
 <body>
@@ -531,10 +575,11 @@ pre{white-space:pre-wrap;font-family:inherit}
   <span style="font-size:1.4rem">📚</span>
   <h1>制度文件智能问答</h1>
   <span id="stats" style="font-size:.75rem;color:#86868b"></span>
+  <button id="adminBtn" onclick="adminLogin()" style="background:none;border:1px solid #d1d1d6;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer;color:#86868b">🔑 管理员</button>
 </div>
 
 <div class="container">
-  <div class="upload-area" id="uploadArea">
+  <div class="upload-area" id="uploadArea" style="display:none">
     <div class="icon">📁</div>
     <p>点击或拖拽上传制度文件</p>
     <div class="formats">支持 PDF / Excel / TXT 格式</div>
@@ -552,8 +597,62 @@ pre{white-space:pre-wrap;font-family:inherit}
   <button id="askBtn" onclick="askQuestion()" disabled>提问</button>
 </div>
 
+<div class="toast" id="toastBox"></div>
+
 <script>
+var toastTimer=null;function showToast(m){var t=document.getElementById("toastBox");t.textContent=m;t.classList.add("visible");clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.remove("visible")},2500)}
+
 var hasDocs = false;
+var adminToken = localStorage.getItem('adminToken') || '';
+
+// 管理员登录
+function adminLogin() {
+  if (adminToken) {
+    // 已登录，登出
+    fetch('/api/logout', {method:'POST', headers:{'Authorization':'Bearer '+adminToken}});
+    adminToken = '';
+    localStorage.removeItem('adminToken');
+    document.getElementById('adminBtn').textContent = '🔑 管理员';
+    document.getElementById('uploadArea').style.display = 'none';
+    document.getElementById('docList').innerHTML = '';
+    document.getElementById('stats').textContent = '';
+    showToast('已退出管理');
+    return;
+  }
+  var pwd = prompt('请输入管理员密码：');
+  if (!pwd) return;
+  fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pwd})})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        adminToken = d.token;
+        localStorage.setItem('adminToken', adminToken);
+        document.getElementById('adminBtn').textContent = '🔓 退出管理';
+        document.getElementById('uploadArea').style.display = '';
+        showToast('管理员登录成功');
+        refreshDocs();
+      } else {
+        showToast(d.error || '密码错误');
+      }
+    });
+}
+
+// 检查登录状态
+function checkAuth() {
+  if (!adminToken) return;
+  fetch('/api/check-auth', {headers:{'Authorization':'Bearer '+adminToken}})
+    .then(r => r.json())
+    .then(d => {
+      if (d.admin) {
+        document.getElementById('adminBtn').textContent = '🔓 退出管理';
+        document.getElementById('uploadArea').style.display = '';
+        refreshDocs();
+      } else {
+        adminToken = '';
+        localStorage.removeItem('adminToken');
+      }
+    });
+}
 
 // 上传
 var uploadArea = document.getElementById("uploadArea");
@@ -569,12 +668,13 @@ uploadArea.ondrop = function(e){
 fileInput.onchange = function(){ if(fileInput.files.length) uploadFiles(fileInput.files); };
 
 function uploadFiles(files){
+  if (!adminToken) { showToast('请先以管理员身份登录'); return; }
   for(var i=0;i<files.length;i++){
     var fd = new FormData();
     fd.append("file", files[i]);
     addMsg("system", "⏳ 正在上传: " + files[i].name + "...");
     
-    fetch("/api/upload", {method:"POST", body:fd})
+    fetch("/api/upload", {method:"POST", body:fd, headers:{'Authorization':'Bearer '+adminToken}})
       .then(function(r){ return r.json(); })
       .then(function(d){
         if(d.error){ addMsg("error", "❌ " + d.error); return; }
@@ -587,10 +687,12 @@ function uploadFiles(files){
 }
 
 function refreshDocs(){
-  fetch("/api/docs").then(function(r){ return r.json(); }).then(function(d){
-    hasDocs = d.docs.length > 0;
-    document.getElementById("questionInput").disabled = !hasDocs;
-    document.getElementById("askBtn").disabled = !hasDocs;
+  if (!adminToken) return;
+  fetch("/api/docs", {headers:{'Authorization':'Bearer '+adminToken}}).then(function(r){ return r.json(); }).then(function(d){
+    if (d.error) return;
+    hasDocs = true;
+    document.getElementById("questionInput").disabled = false;
+    document.getElementById("askBtn").disabled = false;
     document.getElementById("stats").textContent = d.docs.length + " 个文件 · " + d.total_chunks + " 个文本块";
     
     var list = document.getElementById("docList");
@@ -603,19 +705,15 @@ function refreshDocs(){
         '<button class="del" onclick="delDoc(\'' + doc.id + '\')">&times;</button>';
       list.appendChild(chip);
     });
-    
-    if(hasDocs){
-      var empty = document.getElementById("emptyState");
-      if(empty) empty.textContent = "💬 输入问题开始查询制度文件";
-    }
   });
 }
 
 function delDoc(id){
-  fetch("/api/docs/"+id, {method:"DELETE"}).then(function(){ refreshDocs(); });
+  if (!adminToken) return;
+  fetch("/api/docs/"+id, {method:"DELETE", headers:{'Authorization':'Bearer '+adminToken}}).then(function(){ refreshDocs(); });
 }
 
-// 提问
+// 提问（不需要管理员权限）
 function askQuestion(){
   var input = document.getElementById("questionInput");
   var q = input.value.trim();
@@ -665,7 +763,19 @@ function addMsg(type, html){
 
 function esc(s){ var d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
 
-refreshDocs();
+// 初始化
+checkAuth();
+var hasDocs = false;
+// 普通用户也可以提问，先检查是否有文档
+fetch('/api/ask', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question:'test'})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.error || d.error.indexOf('请先上传') === -1) {
+      hasDocs = true;
+      document.getElementById('questionInput').disabled = false;
+      document.getElementById('askBtn').disabled = false;
+    }
+  });
 </script>
 </body>
 </html>"""
